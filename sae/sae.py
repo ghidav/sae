@@ -8,7 +8,8 @@ import torch
 from huggingface_hub import snapshot_download
 from natsort import natsorted
 from safetensors.torch import load_model, save_model
-from torch import Tensor, nn
+from torch import Tensor, nn, optim
+import math as m
 
 from .config import SaeConfig
 from .utils import decoder_impl
@@ -40,6 +41,40 @@ class ForwardOutput(NamedTuple):
     multi_topk_fvu: Tensor
     """Multi-TopK FVU, if applicable."""
 
+# Initialization
+
+def initialize_angular_distance(N, M, max_iters=1000, lr=1e-2):
+
+    vectors = torch.randn(N, M, requires_grad=False)
+    vectors = vectors / vectors.norm(dim=1, keepdim=True)
+    vectors.requires_grad = True
+    
+
+    desired_cosine = m.cos(2 * torch.pi / N)
+    
+    optimizer = optim.Adam([vectors], lr=lr)
+
+    for _ in range(max_iters):
+        optimizer.zero_grad()
+        
+        cosine_matrix = torch.mm(vectors, vectors.t())
+        cosine_matrix = cosine_matrix - torch.eye(N)
+        
+        # Compute penalties
+        penalties = torch.clamp(cosine_matrix - desired_cosine, min=0)
+        loss = penalties.sum()
+        
+        loss.backward()
+        optimizer.step()
+        
+        # Re-normalize vectors to enforce unit norm
+        vectors.data = vectors.data / vectors.data.norm(dim=1, keepdim=True)
+        
+        if loss.item() < 1e-6:
+            break
+    
+    return vectors.detach()
+
 
 class Sae(nn.Module):
     def __init__(
@@ -56,10 +91,20 @@ class Sae(nn.Module):
         self.d_in = d_in
         self.num_latents = cfg.num_latents or d_in * cfg.expansion_factor
 
+        if self.cfg.init == "orthogonal":
+            self.W_dec = nn.Parameter(torch.empty((self.num_latents, self.d_in), device=device))
+            self.W_dec.data = initialize_angular_distance(self.num_latents, self.d_in).to(device)
+        elif self.cfg.init == "kaiming":
+            self.W_dec = nn.Parameter(torch.empty((self.num_latents, self.d_in), device=device))
+            nn.init.kaiming_normal_(self.W_dec.data)
+        else:
+            raise ValueError(f"Unknown initialization method: {cfg.init}")
+
         self.encoder = nn.Linear(d_in, self.num_latents, device=device, dtype=dtype)
         self.encoder.bias.data.zero_()
 
-        self.W_dec = nn.Parameter(self.encoder.weight.data.clone()) if decoder else None
+        self.encoder.weight.data = self.W_dec.data.clone().detach()
+
         if decoder and self.cfg.normalize_decoder:
             self.set_decoder_norm_to_unit_norm()
 

@@ -1,12 +1,47 @@
 import os
-from typing import Any, Type, TypeVar, cast
+from typing import Any, Type, TypeVar, cast, Iterable, Dict
 
 import torch
+from functools import partial
 from accelerate.utils import send_to_device
 from torch import Tensor, nn
+from torch.utils.data import DataLoader
 from transformers import PreTrainedModel
+from .config import TrainConfig
 
 T = TypeVar("T")
+
+# Iterator
+class CycleIterator:
+    """An iterator that cycles through an iterable indefinitely.
+
+    Example:
+        >>> iterator = CycleIterator([1, 2, 3])
+        >>> [next(iterator) for _ in range(5)]
+        [1, 2, 3, 1, 2]
+
+    Note:
+        Unlike ``itertools.cycle``, this iterator does not cache the values of the iterable.
+    """
+
+    def __init__(self, iterable: Iterable) -> None:
+        self.iterable = iterable
+        self.epoch = 0
+        self._iterator = None
+
+    def __next__(self) -> Any:
+        if self._iterator is None:
+            self._iterator = iter(self.iterable)
+        try:
+            return next(self._iterator)
+        except StopIteration:
+            print(f"CycleIterator: Epoch {self.epoch} completed.")
+            self._iterator = iter(self.iterable)
+            self.epoch += 1
+            return next(self._iterator)
+
+    def __iter__(self) -> "CycleIterator":
+        return self
 
 
 def assert_type(typ: Type[T], obj: Any) -> T:
@@ -61,32 +96,49 @@ def get_layer_list(model: PreTrainedModel) -> tuple[str, nn.ModuleList]:
 
 @torch.inference_mode()
 def resolve_widths(
-    model: PreTrainedModel, module_names: list[str], dim: int = -1,
+    cfg: TrainConfig,
+    model: PreTrainedModel,
+    module_names: list[str],
+    dim: int = -1,
+    dl: DataLoader | None = None,
 ) -> dict[str, int]:
     """Find number of output dimensions for the specified modules."""
-    module_to_name = {
-        model.get_submodule(name): name for name in module_names
-    }
-    shapes: dict[str, int] = {}
+    module_to_name = {model.get_submodule(name): name for name in module_names}
+    hidden_dict: Dict[str, Tensor] = {}
 
-    def hook(module, _, output):
-        # Unpack tuples if needed
-        if isinstance(output, tuple):
-            output, *_ = output
+    def standard_hook(
+        module: nn.Module,
+        _,
+        outputs,
+        module_to_name: Dict[nn.Module, str],
+        hidden_dict: Dict[str, Tensor],
+    ):
+        # Maybe unpack tuple outputs
+        if isinstance(outputs, tuple):
+            outputs = outputs[0]
 
         name = module_to_name[module]
-        shapes[name] = output.shape[dim]
+        hidden_dict[name] = outputs.flatten(0, 1)
 
-    handles = [
-        mod.register_forward_hook(hook) for mod in module_to_name
-    ]
-    dummy = send_to_device(model.dummy_inputs, model.device)
+    hook = partial(
+        standard_hook,
+        module_to_name=module_to_name,
+        hidden_dict=hidden_dict,
+    )
+
+    handles = [mod.register_forward_hook(hook) for mod in module_to_name]
+    if dl is None:
+        dummy = model.dummy_inputs
+    else:
+        dummy = next(iter(dl))
+    dummy = send_to_device(dummy, model.device)
     try:
         model(**dummy)
     finally:
         for handle in handles:
             handle.remove()
-    
+
+    shapes = {name: hidden.shape[dim] for name, hidden in hidden_dict.items()}
     return shapes
 
 

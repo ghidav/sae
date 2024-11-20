@@ -24,10 +24,19 @@ class SaeConfig(Serializable):
     multi_topk: bool = False
     """Use Multi-TopK loss."""
 
+    init: str = "kaiming"
+    """Initialization method for the SAE weights."""
+
 
 @dataclass
 class TrainConfig(Serializable):
     sae: SaeConfig
+
+    num_training_tokens: int
+    """Number of tokens in the training set."""
+
+    max_seq_len: int
+    """Maximum sequence length."""
 
     batch_size: int = 8
     """Batch size measured in sequences."""

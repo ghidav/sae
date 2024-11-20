@@ -15,14 +15,13 @@ from tqdm.auto import tqdm
 from transformers import PreTrainedModel, get_linear_schedule_with_warmup
 
 from .config import TrainConfig
-from .data import MemmapDataset
 from .sae import Sae
-from .utils import geometric_median, get_layer_list, resolve_widths
+from .utils import geometric_median, get_layer_list, resolve_widths, CycleIterator
 
 
 class SaeTrainer:
     def __init__(
-        self, cfg: TrainConfig, dataset: HfDataset | MemmapDataset, model: PreTrainedModel
+        self, cfg: TrainConfig, dl: DataLoader, model: PreTrainedModel
     ):
         if cfg.hookpoints:
             assert not cfg.layers, "Cannot specify both `hookpoints` and `layers`."
@@ -46,15 +45,13 @@ class SaeTrainer:
             cfg.hookpoints = [f"{layers_name}.{i}" for i in cfg.layers]
 
         self.cfg = cfg
-        self.dataset = dataset
+        self.dl = dl
         self.distribute_modules()
 
         N = len(cfg.hookpoints)
-        assert isinstance(dataset, Sized)
-        num_examples = len(dataset)
 
         device = model.device
-        input_widths = resolve_widths(model, cfg.hookpoints)
+        input_widths = resolve_widths(cfg, model, cfg.hookpoints)
         unique_widths = set(input_widths.values())
 
         if cfg.distribute_modules and len(unique_widths) > 1:
@@ -69,6 +66,30 @@ class SaeTrainer:
             hook: Sae(input_widths[hook], cfg.sae, device)
             for hook in self.local_hookpoints()
         }
+
+        # Dataloader
+        self.dl = dl
+        shapes = resolve_widths(cfg, model, cfg.hookpoints, dim=0, dl=self.dl)
+        print(input_widths, shapes)
+        real_seq_len = list(shapes.values())[0] // cfg.batch_size
+        print(
+            f"The specified maximum sequence length is {cfg.max_seq_len}. "
+            f"The real sequence length after the SAE hook is {real_seq_len}"
+        )
+
+        self.num_training_tokens = cfg.num_training_tokens
+        self.dl = CycleIterator(self.dl)
+
+        self.tokens_per_batch = cfg.batch_size * real_seq_len
+        self.training_steps = self.num_training_tokens // self.tokens_per_batch
+
+        # Variables for global stats
+        self.global_step = 0
+        self.num_tokens_since_fired = {
+            name: torch.zeros(sae.num_latents, device=device, dtype=torch.long)
+            for name, sae in self.saes.items()
+        }
+
         # Re-initialize the decoder for transcoder training. By default the Sae class
         # initializes the decoder with the transpose of the encoder.
         if cfg.transcode:
@@ -104,7 +125,7 @@ class SaeTrainer:
         }
         self.optimizer = Adam(pgs)
         self.lr_scheduler = get_linear_schedule_with_warmup(
-            self.optimizer, cfg.lr_warmup_steps, num_examples // cfg.batch_size
+            self.optimizer, cfg.lr_warmup_steps, self.training_steps
         )
 
     def load_state(self, path: str):
@@ -154,28 +175,13 @@ class SaeTrainer:
         print(f"Number of SAE parameters: {num_sae_params:_}")
         print(f"Number of model parameters: {num_model_params:_}")
 
-        num_batches = len(self.dataset) // self.cfg.batch_size
-        if self.global_step > 0:
-            assert hasattr(self.dataset, "select"), "Dataset must implement `select`"
-
-            n = self.global_step * self.cfg.batch_size
-            ds = self.dataset.select(range(n, len(self.dataset)))  # type: ignore
-        else:
-            ds = self.dataset
-
         device = self.model.device
-        dl = DataLoader(
-            ds, # type: ignore
-            batch_size=self.cfg.batch_size,
-            # NOTE: We do not shuffle here for reproducibility; the dataset should
-            # be shuffled before passing it to the trainer.
-            shuffle=False,
-        )
+
         pbar = tqdm(
             desc="Training", 
             disable=not rank_zero, 
             initial=self.global_step, 
-            total=num_batches,
+            total=self.training_steps,
         )
 
         did_fire = {
@@ -211,7 +217,11 @@ class SaeTrainer:
             if self.cfg.transcode:
                 input_dict[name] = inputs.flatten(0, 1)
 
-        for batch in dl:
+        for idx, batch in enumerate(self.dl):
+            
+            if self.global_step >= self.training_steps:
+                break
+
             input_dict.clear()
             output_dict.clear()
 

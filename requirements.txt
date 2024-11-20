@@ -1,0 +1,9 @@
+torch
+transformers
+datasets
+accelerate
+simple_parsing
+einops
+natsort
+bitsandbytes
+wandb
